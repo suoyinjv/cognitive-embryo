@@ -209,6 +209,23 @@ class MetaCognitionController:
         # 查询相似失败
         similar = self.memory.query_similar_failures(task.description, error)
 
+        # 快速路径：错误信息明确指示工具执行错误 → 触发工具修复
+        if "工具执行错误:" in error:
+            # 提取工具名 → 触发TCP修复（不是新建，是修复已有工具的bug）
+            # 从 memory 中获取该工具的详细信息传给 TCP
+            tool_name = error.split("工具执行错误:")[1].split(" -")[0].strip()
+            tool_spec = {
+                "name": tool_name,
+                "description": f"修复工具 {tool_name} 的参数签名错误",
+                "fix_existing": True,
+                "error": error,
+            }
+            return FailureDecision(
+                action="create_tool",
+                tool_spec=tool_spec,
+                reason=f"工具执行错误: {error[:100]}",
+            )
+
         # 快速路径：错误信息明确指示工具真空
         tool_vacuum_signals = [
             "需要创造新工具", "无可用工具", "未能调用任何工具",
@@ -224,8 +241,10 @@ class MetaCognitionController:
 
         if root_cause == FailureRootCause.TOOL_INADEQUATE:
             if retry_count >= config.max_retries_per_task:
-                # 触发工具创造
-                tool_spec = await self._generate_tool_spec(task, error)
+                # 触发工具创造 - 从错误提取缺失工具名
+                missing_match = re.search(r'工具未找到:\s*(\S+)', error)
+                missing_tool = missing_match.group(1) if missing_match else None
+                tool_spec = await self._generate_tool_spec(task, error, missing_tool)
                 return FailureDecision(
                     action="create_tool",
                     tool_spec=tool_spec,
@@ -274,19 +293,53 @@ class MetaCognitionController:
 
     # ── 工具需求 ──
 
-    async def _generate_tool_spec(self, task: Task, error: str) -> dict:
-        prompt = f"""任务失败，需要新工具:
-任务: {task.description}
-错误: {error}
-已有工具: {task.tools_used}
+    # 已知 API 端点工具的正确签名（跨 LLM 幻觉）
+    KNOWN_API_TOOLS: dict = {
+        "get_market_status": {
+            "name": "get_market_status",
+            "description": "获取市场全局状态：竞品均价/供应商价/库存/广告/当日利润/天",
+            "parameters": [],
+            "return_type": "str",
+        },
+        "get_daily_report": {
+            "name": "get_daily_report",
+            "description": "获取累计销售报告：总收入/总成本/总利润/销量",
+            "parameters": [],
+            "return_type": "str",
+        },
+        "advance_day": {
+            "name": "advance_day",
+            "description": "推进到下一天，触发市场波动和销售结算",
+            "parameters": [],
+            "return_type": "str",
+        },
+    }
 
-生成新工具规格（JSON）:
-{{
-  "name": "snake_case函数名",
-  "description": "功能描述",
-  "parameters": [{{"name": "x", "type": "str", "description": "...", "required": true}}],
-  "return_type": "str"
-}}"""
+    async def _generate_tool_spec(self, task: Task, error: str, missing_tool: str | None = None) -> dict:
+        # 已知 API 端点 → 直接返回规范签名，无需 LLM
+        if missing_tool and missing_tool in self.KNOWN_API_TOOLS:
+            logger.info("tcp.known_api", tool=missing_tool)
+            return dict(self.KNOWN_API_TOOLS[missing_tool])
+
+        explicit = ""
+        if missing_tool:
+            explicit = (
+                f"错误明确指示缺失工具名为「{missing_tool}」，"
+                f"请创建该工具。名称必须为「{missing_tool}」。\n"
+            )
+        prompt = (
+            f"任务失败，需要新工具:\n"
+            f"任务: {task.description}\n"
+            f"错误: {error}\n"
+            f"已有工具: {task.tools_used}\n"
+            f"{explicit}生成新工具规格（JSON）:\n"
+            '{\n'
+            '  "name": "snake_case函数名",\n'
+            '  "description": "功能描述",\n'
+            '  "parameters": [{"name": "x", "type": "str", "description": "...", "required": true}],\n'
+            '  "return_type": "str"\n'
+            '}'
+        )
         resp = await self._llm.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],

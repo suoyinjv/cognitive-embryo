@@ -208,6 +208,10 @@ class EvolutionMemory:
     # ── Tool ──
 
     def register_tool(self, tool: CreatedTool, source_task_id: str = "") -> None:
+        # 同名工具替换: 移除旧版
+        old_ids = [k for k, v in self.tools.items() if v.name == tool.name and k != tool.id]
+        for oid in old_ids:
+            del self.tools[oid]
         self.tools[tool.id] = tool
         self.events.append(EvolutionEvent(
             type="tool_created", task_id=source_task_id,

@@ -39,11 +39,13 @@ class CognitiveEmbryo:
         self.mcc = MetaCognitionController(self.memory, self.executor)
         self.goal_examiner = GoalExaminer(self.memory)
         self.safety = SafetyShell()
+        self._original_goal: str = ""  # 保存原始目标，修复后自动恢复
 
     async def run(self, goal_desc: str, max_iterations: Optional[int] = None) -> dict:
         max_iter = max_iterations or config.max_iterations
         iteration = 0
         current_goal = goal_desc
+        self._original_goal = goal_desc
 
         # 记录目标
         goal = Goal(description=current_goal)
@@ -67,7 +69,23 @@ class CognitiveEmbryo:
                         f"[yellow]原目标:[/yellow] {current_goal}\n[yellow]新目标:[/yellow] {revision.new_goal}",
                         title=f"🔄 目标转向 (健康度: {revision.health_score:.2f})",
                     ))
+                    # 保存前一个目标
                     current_goal = revision.new_goal
+                    goal = Goal(description=current_goal)
+                    self.memory.save_goal(goal)
+                    task_dag = await self.mcc.plan(current_goal)
+                    continue
+
+                # 健康度恢复且当前是修复子目标 → 自动切回原始目标
+                if (revision.health_score >= 0.7
+                    and revision.recommendation == "continue"
+                    and current_goal != self._original_goal
+                    and not any(s == "failed" for s in task_dag.status.values())):
+                    console.print(Panel(
+                        f"[green]修复完成，恢复原始目标:[/green] {self._original_goal}",
+                        title="↩️ 目标恢复",
+                    ))
+                    current_goal = self._original_goal
                     goal = Goal(description=current_goal)
                     self.memory.save_goal(goal)
                     task_dag = await self.mcc.plan(current_goal)

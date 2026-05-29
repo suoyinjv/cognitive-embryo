@@ -157,15 +157,25 @@ class Executor:
             func = namespace.get(tool.name) or namespace.get(name)
 
             if not func:
-                return ExecutionResult(success=False, error=f"工具函数 {name} 未在代码中定义")
+                return ExecutionResult(success=False, error=f"工具执行错误: {name} - 函数未在代码中定义", tool_called=name)
 
             result = func(**args)
             return ExecutionResult(success=True, output=str(result), tool_called=name)
 
-        except Exception as e:
+        except TypeError as e:
+            # 工具存在但调用参数不匹配 → 标记为工具修复需求，不是路径熔断
+            error_msg = f"工具执行错误: {name} - 参数不匹配: {e}"
             return ExecutionResult(
                 success=False,
-                error=str(e),
+                error=error_msg,
+                trace=traceback.format_exc(),
+                tool_called=name,
+            )
+        except Exception as e:
+            error_msg = f"工具执行错误: {name} - {e}"
+            return ExecutionResult(
+                success=False,
+                error=error_msg,
                 trace=traceback.format_exc(),
                 tool_called=name,
             )
@@ -216,5 +226,5 @@ class Executor:
     async def create_tool(self, tool_spec: dict, failed_task: Task) -> Optional[CreatedTool]:
         """触发工具创造管线（委托给 ToolCreationPipeline）"""
         from core.tool_creator import ToolCreationPipeline
-        pipeline = ToolCreationPipeline()
+        pipeline = ToolCreationPipeline(memory=self.memory)
         return await pipeline.create(tool_spec, failed_task)
