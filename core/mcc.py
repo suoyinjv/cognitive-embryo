@@ -1,0 +1,336 @@
+"""元认知控制器 — 规划/归因/调度"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+from openai import AsyncOpenAI
+from structlog import get_logger
+
+from config import config
+from core.memory import EvolutionMemory, Task
+
+logger = get_logger(__name__)
+
+
+# ── 枚举 ──
+
+class FailureRootCause(str, Enum):
+    TOOL_INADEQUATE = "tool_inadequate"    # 工具能力真空
+    STRATEGY_FLAWED = "strategy_flawed"    # 策略路径错误
+    ENVIRONMENT_SHIFT = "environment_shift"  # 环境突变
+
+
+@dataclass
+class FailureDecision:
+    action: str  # create_tool | skip | replan
+    tool_spec: Optional[dict] = None
+    reason: str = ""
+
+
+# ── 任务 DAG ──
+
+class TaskDAG:
+    """有向无环图 — 任务依赖管理"""
+
+    def __init__(self, tasks: list[Task], edges: list[tuple[str, str]]) -> None:
+        self.tasks: dict[str, Task] = {t.id: t for t in tasks}
+        self.edges = edges  # (from_id, to_id)
+        self.status: dict[str, str] = {t.id: "ready" for t in tasks}
+
+        # 计算入度、出度
+        self.in_degree: dict[str, int] = defaultdict(int)
+        self.dependents: dict[str, list[str]] = defaultdict(list)
+        for src, dst in edges:
+            self.in_degree[dst] += 1
+            self.dependents[src].append(dst)
+
+        # 初始状态：有依赖的任务标记为 waiting
+        for tid, deg in self.in_degree.items():
+            if deg > 0 and tid in self.status:
+                self.status[tid] = "waiting"
+
+    def get_next_ready(self) -> Optional[Task]:
+        for tid, st in self.status.items():
+            if st == "ready":
+                deps_met = all(
+                    self.status.get(e[0]) == "complete"
+                    for e in self.edges if e[1] == tid
+                )
+                if deps_met:
+                    self.status[tid] = "running"
+                    return self.tasks[tid]
+        return None
+
+    def mark_complete(self, task_id: str, result: object) -> None:
+        self.status[task_id] = "complete"
+        # 解锁依赖此任务的后续任务
+        for dep in self.dependents.get(task_id, []):
+            if self.status.get(dep) == "waiting":
+                deps_met = all(
+                    self.status.get(e[0]) == "complete"
+                    for e in self.edges if e[1] == dep
+                )
+                if deps_met:
+                    self.status[dep] = "ready"
+
+    def mark_blocked(self, task_id: str, reason: str = "") -> None:
+        self.status[task_id] = "blocked"
+
+    def mark_skip(self, task_id: str, reason: str = "") -> None:
+        self.status[task_id] = "skipped"
+
+    def mark_failed(self, task_id: str) -> None:
+        self.status[task_id] = "failed"
+
+    def retry_task(self, task_id: str) -> None:
+        self.status[task_id] = "ready"
+
+    @property
+    def all_done(self) -> bool:
+        return all(s in ("complete", "blocked", "skipped") for s in self.status.values())
+
+    def summary(self) -> str:
+        counts = defaultdict(int)
+        for s in self.status.values():
+            counts[s] += 1
+        return ", ".join(f"{k}={v}" for k, v in counts.items())
+
+
+# ── 规划 Prompt ──
+
+PLAN_SYSTEM = """你是任务规划器。将目标分解为子任务 DAG。
+
+规则:
+1. 每个子任务单一职责、可验证
+2. 明确依赖关系
+3. 标注所需工具类型
+
+输出 JSON:
+{
+  "tasks": [
+    {
+      "id": "task_<desc>",
+      "type": "search|calculate|analyze|execute",
+      "description": "具体任务描述",
+      "depends_on": [],
+      "tools_needed": ["工具名"]
+    }
+  ]
+}"""
+
+ATTRIBUTION_SYSTEM = """你是失败归因引擎。分析失败根因。
+
+判定标准:
+- tool_inadequate: 工具无法完成任务 → 创造新工具
+- strategy_flawed: 策略/参数错误 → 熔断路径
+- environment_shift: 外部环境变化 → 等待
+
+只返回分类: tool_inadequate / strategy_flawed / environment_shift"""
+
+# ── 元认知控制器 ──
+
+class MetaCognitionController:
+    """元认知控制器 — 规划 + 归因"""
+
+    def __init__(self, memory: EvolutionMemory, executor=None) -> None:
+        self.memory = memory
+        self.executor = executor
+        self._llm = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+        self._model = config.model
+        self.failure_counts: dict[str, int] = defaultdict(int)
+
+    async def plan(self, goal: str) -> TaskDAG:
+        """目标 → 任务 DAG"""
+        # 查询历史成功路径 + 因果链
+        similar = self.memory.query_similar_goals(goal, top_k=3)
+        solved = self.memory.query_solved_by(goal)
+        melted = self.memory.query_melted_paths()
+        context = ""
+        if similar:
+            paths = "\n".join(
+                f"- {s['goal'][:60]}: {' → '.join(s['success_path'][:3])}"
+                for s in similar
+            )
+            context += f"\n历史成功路径:\n{paths}\n"
+        if solved:
+            context += "\n历史解决方案(因果链):\n" + "\n".join(
+                f"- 问题: {s['problem']} → 工具: {s['solution_tool']}"
+                for s in solved[:3]
+            ) + "\n"
+        if melted:
+            context += "\n已失效路径(规避以下方式):\n" + "\n".join(
+                f"- {m}" for m in melted[:3]
+            ) + "\n"
+
+        prompt = f"目标: {goal}{context}"
+        resp = await self._llm.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": PLAN_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+
+        tasks, edges = self._parse_plan(resp.choices[0].message.content or "", goal)
+        logger.info("mcc.plan", goal=goal[:60], tasks=len(tasks))
+
+        return TaskDAG(tasks, edges)
+
+    async def handle_failure(
+        self, task: Task, error: str, dag: TaskDAG
+    ) -> FailureDecision:
+        """失败处理: 归因 → 决策"""
+        self.failure_counts[task.id] += 1
+        retry_count = self.failure_counts[task.id]
+
+        # 查询相似失败
+        similar = self.memory.query_similar_failures(task.description, error)
+
+        # 快速路径：错误信息明确指示工具真空
+        tool_vacuum_signals = [
+            "需要创造新工具", "无可用工具", "未能调用任何工具",
+            "工具库为空", "幻觉输出", "tool_calls为空",
+            "需要副作用操作", "未调用任何工具",
+        ]
+        if any(sig in error for sig in tool_vacuum_signals):
+            root_cause = FailureRootCause.TOOL_INADEQUATE
+        else:
+            # 因果归因
+            root_cause = await self._diagnose(task, error, similar)
+
+        if root_cause == FailureRootCause.TOOL_INADEQUATE:
+            if retry_count >= config.max_retries_per_task:
+                # 触发工具创造
+                tool_spec = await self._generate_tool_spec(task, error)
+                return FailureDecision(
+                    action="create_tool",
+                    tool_spec=tool_spec,
+                    reason=f"工具真空: {error[:100]}",
+                )
+            return FailureDecision(action="skip", reason="等待重试阈值")
+
+        elif root_cause == FailureRootCause.STRATEGY_FLAWED:
+            self.memory.melt_path(task.id)
+            return FailureDecision(action="replan", reason="路径熔断")
+
+        else:
+            return FailureDecision(action="skip", reason="环境异常")
+
+    # ── 归因 ──
+
+    async def _diagnose(
+        self, task: Task, error: str, similar: list[dict]
+    ) -> FailureRootCause:
+        history = "\n".join(
+            f"- [{s.get('root_cause', '?')}] {s.get('description', '')[:100]}"
+            for s in similar[:3]
+        )
+        prompt = f"""任务: {task.description}
+失败: {error}
+历史相似失败:
+{history}
+
+判断根因分类:"""
+        resp = await self._llm.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": ATTRIBUTION_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        raw = resp.choices[0].message.content or ""
+        raw = raw.strip().lower()
+
+        if "tool_inadequate" in raw:
+            return FailureRootCause.TOOL_INADEQUATE
+        elif "strategy" in raw:
+            return FailureRootCause.STRATEGY_FLAWED
+        return FailureRootCause.ENVIRONMENT_SHIFT
+
+    # ── 工具需求 ──
+
+    async def _generate_tool_spec(self, task: Task, error: str) -> dict:
+        prompt = f"""任务失败，需要新工具:
+任务: {task.description}
+错误: {error}
+已有工具: {task.tools_used}
+
+生成新工具规格（JSON）:
+{{
+  "name": "snake_case函数名",
+  "description": "功能描述",
+  "parameters": [{{"name": "x", "type": "str", "description": "...", "required": true}}],
+  "return_type": "str"
+}}"""
+        resp = await self._llm.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        text = resp.choices[0].message.content or ""
+        try:
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(0))
+        except json.JSONDecodeError:
+            pass
+        return {"name": f"tool_for_{task.id[:8]}", "description": task.description, "parameters": []}
+
+    # ── 解析 ──
+
+    def _parse_plan(self, response: str, goal_id: str) -> tuple[list[Task], list[tuple[str, str]]]:
+        try:
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                tasks_raw = data.get("tasks", [])
+            else:
+                tasks_raw = self._fallback_parse(response)
+        except (json.JSONDecodeError, KeyError):
+            tasks_raw = self._fallback_parse(response)
+
+        tasks = []
+        edges = []
+        for t in tasks_raw:
+            if isinstance(t, str):
+                tasks.append(Task(goal_id=goal_id, type="general", description=t))
+            else:
+                tid = t.get("id", f"task_{len(tasks)}")
+                task = Task(
+                    id=tid,
+                    goal_id=goal_id,
+                    type=t.get("type", "general"),
+                    description=t.get("description", t.get("desc", "")),
+                    depends_on=t.get("depends_on", []),
+                )
+                tasks.append(task)
+                for dep in task.depends_on:
+                    edges.append((dep, tid))
+
+        if not tasks:
+            tasks.append(Task(goal_id=goal_id, type="general", description=response[:200]))
+
+        return tasks, edges
+
+    @staticmethod
+    def _fallback_parse(response: str) -> list[dict]:
+        tasks = []
+        for line in response.split("\n"):
+            line = line.strip()
+            if re.match(r'^\d+[\.\)、]', line):
+                desc = re.sub(r'^\d+[\.\)、]\s*', '', line)
+                tasks.append({"description": desc, "depends_on": []})
+        if not tasks:
+            tasks.append({"description": response.strip()[:200], "depends_on": []})
+        return tasks

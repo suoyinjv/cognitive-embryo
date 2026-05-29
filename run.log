@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/suoyi/cognitive-embryo/main.py", line 23, in <module>
+    from core.mcc import MetaCognitionController, FailureDecision
+  File "/home/suoyi/cognitive-embryo/core/mcc.py", line 13, in <module>
+    from structlog import get_logger
+ModuleNotFoundError: No module named 'structlog'
