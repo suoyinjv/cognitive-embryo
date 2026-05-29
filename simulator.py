@@ -61,9 +61,9 @@ class Market:
         """模拟一天过去，市场波动"""
         self.day += 1
 
-        # ── 随机混乱事件 (20%概率) ──
+        # ── 随机混乱事件 (35%概率) ──
         chaos_event = ""
-        if random.random() < 0.20:
+        if random.random() < 0.35:
             chaos_events = [
                 "supplier_shortage",      # 供应商短缺 → 采购价飙3倍
                 "price_war",              # 竞品价格战 → 竞品价暴跌50%

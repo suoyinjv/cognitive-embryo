@@ -77,6 +77,11 @@ class CognitiveEmbryo:
             task = task_dag.get_next_ready()
             if task is None:
                 if task_dag.all_done:
+                    # 连续运营模式: DAG完成 → 继续下一轮
+                    if iteration < max_iter - 1:
+                        console.print(f"  🔄 [dim]阶段[{iteration}]完成, 进入下一轮规划...[/dim]")
+                        task_dag = await self.mcc.plan(current_goal)
+                        continue
                     break
                 # 有任务但都不就绪 (阻塞/等待)
                 await asyncio.sleep(0.1)
@@ -111,14 +116,7 @@ class CognitiveEmbryo:
                         decision.tool_spec or {}, task
                     )
                     if new_tool:
-                        self.memory.register_tool(new_tool)
-                        # 记录因果边: 失败任务 → 新工具 (SOLVED_BY)
-                        self.memory.add_causal_link(
-                            from_id=task.id, to_id=new_tool.id,
-                            relation="SOLVED_BY",
-                            from_type="task", to_type="tool",
-                            description=f"工具真空: {task.description[:60]} → {new_tool.name}"
-                        )
+                        self.memory.register_tool(new_tool, source_task_id=task.id)
                         task_dag.retry_task(task.id)
                         console.print(f"    ✅ 新工具注册: {new_tool.name}")
                     else:
@@ -187,29 +185,21 @@ def _seed_tools(memory: EvolutionMemory) -> None:
             "name": "calculate", "description": "执行数学计算",
             "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式"}}, "required": ["expression"]},
         }),
-        # ── 电商模拟器工具 ──
-        ("get_market_status", "获取电商市场全局状态（价格/库存/竞品/利润）",
-'''import urllib.request, json
-def get_market_status():
-    with urllib.request.urlopen("http://127.0.0.1:5800/market-status") as r:
-        return json.dumps(json.loads(r.read()), ensure_ascii=False)''',
-         {"name": "get_market_status", "description": "获取当前市场全局状态：供应商价格、竞品均价、我的售价、库存、收入、利润",
-          "parameters": {"type": "object", "properties": {}, "required": []}}),
-
-        ("get_supplier_price", "查询供应商采购价格和趋势",
-'''import urllib.request, json
-def get_supplier_price():
-    with urllib.request.urlopen("http://127.0.0.1:5800/supplier-price") as r:
-        return json.dumps(json.loads(r.read()), ensure_ascii=False)''',
-         {"name": "get_supplier_price", "description": "查询供应商采购价格和趋势",
-          "parameters": {"type": "object", "properties": {}, "required": []}}),
-
+        # ── 电商模拟器工具 (删除了 get_market_status 和 get_daily_report 以迫使TCP触发) ──
         ("get_competitor_price", "查询竞品价格",
 '''import urllib.request, json
 def get_competitor_price():
     with urllib.request.urlopen("http://127.0.0.1:5800/competitor-price") as r:
         return json.dumps(json.loads(r.read()), ensure_ascii=False)''',
          {"name": "get_competitor_price", "description": "查询竞品均价和竞品数量",
+          "parameters": {"type": "object", "properties": {}, "required": []}}),
+
+        ("get_supplier_price", "查询供应商采购价格",
+'''import urllib.request, json
+def get_supplier_price():
+    with urllib.request.urlopen("http://127.0.0.1:5800/supplier-price") as r:
+        return json.dumps(json.loads(r.read()), ensure_ascii=False)''',
+         {"name": "get_supplier_price", "description": "查询供应商当前采购价格和趋势",
           "parameters": {"type": "object", "properties": {}, "required": []}}),
 
         ("adjust_price", "调整我的售价", 

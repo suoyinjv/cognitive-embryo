@@ -109,7 +109,20 @@ PLAN_SYSTEM = """你是任务规划器。将目标分解为子任务 DAG。
 规则:
 1. 每个子任务单一职责、可验证
 2. 明确依赖关系
-3. 标注所需工具类型
+3. 运行的模拟器中时间需要推进
+
+可用工具列表:
+- get_supplier_price: 查询供应商价格
+- get_competitor_price: 查询竞品价格
+- adjust_price: 调整售价
+- run_ad_campaign: 投放广告
+- restock_inventory: 采购补货
+- advance_day: 推进到下一天（每天结束时必须调用！）
+- get_daily_report: 获取累计销售报告
+- calculate: 执行数学计算
+
+重要: 每轮运营必须包含"advance_day"任务来推进时间。不推进时间则利润不会变化。
+注意: 没有万能的市场状态查询工具。分析市场需要分别调用各工具获取原始数据。
 
 输出 JSON:
 {
@@ -201,6 +214,7 @@ class MetaCognitionController:
             "需要创造新工具", "无可用工具", "未能调用任何工具",
             "工具库为空", "幻觉输出", "tool_calls为空",
             "需要副作用操作", "未调用任何工具",
+            "工具未找到",
         ]
         if any(sig in error for sig in tool_vacuum_signals):
             root_cause = FailureRootCause.TOOL_INADEQUATE

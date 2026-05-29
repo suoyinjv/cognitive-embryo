@@ -207,13 +207,22 @@ class EvolutionMemory:
 
     # ── Tool ──
 
-    def register_tool(self, tool: CreatedTool) -> None:
+    def register_tool(self, tool: CreatedTool, source_task_id: str = "") -> None:
         self.tools[tool.id] = tool
         self.events.append(EvolutionEvent(
-            type="tool_created", task_id="",
+            type="tool_created", task_id=source_task_id,
             description=f"新工具: {tool.name}",
             detail={"tool_id": tool.id, "tool_name": tool.name},
         ))
+        if source_task_id:
+            self.add_causal_link(
+                from_id=source_task_id,
+                to_id=tool.id,
+                relation="SOLVED_BY",
+                from_type="task",
+                to_type="tool",
+                description=f"工具真空 → {tool.name}",
+            )
         self.save()
 
     def list_active_tools(self) -> list[CreatedTool]:
@@ -232,6 +241,13 @@ class EvolutionMemory:
             type="path_melted", task_id=task_id,
             description="策略路径熔断",
         ))
+        # 记录熔断因果边
+        self.add_causal_link(
+            from_id=task_id, to_id=task_id,
+            relation="MELTED",
+            from_type="task", to_type="task",
+            description=f"策略路径熔断: {task_id}",
+        )
         self.save()
 
     # ── 查询 ──
