@@ -160,6 +160,23 @@ class Executor:
             if not func:
                 return ExecutionResult(success=False, error=f"工具执行错误: {name} - 函数未在代码中定义", tool_called=name)
 
+            # 定价安全护栏：售价低于成本+10%毛利 → 拒绝
+            if name == "adjust_price":
+                price = args.get("price", 0)
+                try:
+                    import urllib.request, json as _j
+                    with urllib.request.urlopen("http://127.0.0.1:5800/supplier-price", timeout=3) as r:
+                        sp = _j.loads(r.read())["price"]
+                    min_price = round(sp * 1.15, 2)
+                    if price < min_price:
+                        return ExecutionResult(
+                            success=False,
+                            error=f"定价错误: ${price} 低于最低合理售价 ${min_price} (供应商价${sp}×1.15)。请使用更高价格。",
+                            tool_called=name,
+                        )
+                except Exception:
+                    pass  # 网络异常时放行
+
             result = func(**args)
             return ExecutionResult(success=True, output=str(result), tool_called=name)
 
