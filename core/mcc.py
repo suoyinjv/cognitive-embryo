@@ -112,6 +112,12 @@ PLAN_SYSTEM = """你是任务规划器。将目标分解为子任务 DAG。
 3. 运行的模拟器中时间需要推进
 
 可用工具列表:
+
+【定价策略铁律】
+1. 售价必须接近竞品均价（competitor_price），不得高于竞品价50%以上
+2. 合理售价 = max(供应商价×1.15, 竞品价×0.9) ~ 竞品价×1.1
+3. 如果当前售价远高于竞品均价，必须立即降价到竞品附近
+4. 如果售价太低（低于供应商价×1.15），必须上调到至少供应商价×1.15
 - get_supplier_price: 查询供应商价格
 - get_competitor_price: 查询竞品价格
 - adjust_price: 调整售价
@@ -126,7 +132,7 @@ PLAN_SYSTEM = """你是任务规划器。将目标分解为子任务 DAG。
 - 纯分析/计算/评估任务不调任何工具 = 空转！禁止单独的分析类任务
 - advance_day 每日规划必须包含1次
 - 每个任务都必须明确指定 tools_needed 字段列明需要调用的工具名
-- 始终检查当前售价是否合理（供应商价+合理利润），如果价格过低必须调价
+- 定价策略铁律: 售价必须接近竞品均价，如果当前售价远高于竞品价必须立即降价。合理售价区间 = 供应商价×1.15 ~ 竞品价×1.1
 - 输出 JSON:
 {
   "tasks": [
@@ -261,7 +267,7 @@ class MetaCognitionController:
             return FailureDecision(action="skip", reason="等待重试阈值")
 
         elif root_cause == FailureRootCause.STRATEGY_FLAWED:
-            self.memory.melt_path(task.id)
+            self.memory.melt_path(task.id, reason=task.description[:80])
             return FailureDecision(action="replan", reason="路径熔断")
 
         else:

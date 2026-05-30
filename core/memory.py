@@ -164,12 +164,14 @@ class EvolutionMemory:
         return results
 
     def query_melted_paths(self) -> list[str]:
-        """查询所有已被熔断的路径描述"""
+        """查询最近的熔断路径描述（只返回最近5条）"""
         descriptions = []
-        for c in self.causal_links:
+        for c in reversed(self.causal_links):
             if c.relation == "MELTED":
                 descriptions.append(c.description)
-        return descriptions
+                if len(descriptions) >= 5:
+                    break
+        return list(reversed(descriptions))
 
     # ── Goal ──
 
@@ -247,17 +249,17 @@ class EvolutionMemory:
 
     # ── 决策熔断 ──
 
-    def melt_path(self, task_id: str) -> None:
+    def melt_path(self, task_id: str, reason: str = "") -> None:
         self.events.append(EvolutionEvent(
             type="path_melted", task_id=task_id,
-            description="策略路径熔断",
+            description=f"策略路径熔断: {reason}",
         ))
         # 记录熔断因果边
         self.add_causal_link(
             from_id=task_id, to_id=task_id,
             relation="MELTED",
             from_type="task", to_type="task",
-            description=f"策略路径熔断: {task_id}",
+            description=f"路径熔断: {reason}",
         )
         self.save()
 
