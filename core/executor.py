@@ -82,11 +82,12 @@ class Executor:
 
             # 有工具：让 LLM 选择工具并调用
             system_prompt = (
-                "你是执行器。任务描述中明确写了要调用的工具名（如 adjust_price/restock_inventory/advance_day/run_ad_campaign），"
-                "你必须调用那个工具，不要用 get_market_status 替代。"
-                "如果任务说'执行调价'，你必须调用 adjust_price。"
-                "如果任务说'推进到下一天'，你必须调用 advance_day。"
-                "如果任务说'投放广告'，你必须调用 run_ad_campaign。"
+                "你是执行器。你必须调用工具来完成任务。"
+                "如果任务说'调价'/'调整售价'/'定价'，你必须调用 adjust_price 工具。"
+                "如果任务说'推进时间'/'下一天'，你必须调用 advance_day 工具。"
+                "如果任务说'补货'/'采购'，你必须调用 restock_inventory 工具。"
+                "如果任务说'广告'/'投放'，你必须调用 run_ad_campaign 工具。"
+                "不要返回纯文本分析结果——你必须调用工具。"
                 "只读查询（市场状态/日报/竞品）才用 get_ 开头的工具。"
             )
             response = await self._llm.chat.completions.create(

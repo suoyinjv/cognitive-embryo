@@ -121,16 +121,19 @@ PLAN_SYSTEM = """你是任务规划器。将目标分解为子任务 DAG。
 - get_daily_report: 获取累计销售报告
 - calculate: 执行数学计算
 
-重要: 每轮运营必须包含"advance_day"任务来推进时间。不推进时间则利润不会变化。
-注意: 没有万能的市场状态查询工具。分析市场需要分别调用各工具获取原始数据。
-
-输出 JSON:
+【强制执行规则】
+- 每轮规划必须包含至少一个「动作型」任务：adjust_price / restock_inventory / run_ad_campaign
+- 纯分析/计算/评估任务不调任何工具 = 空转！禁止单独的分析类任务
+- advance_day 每日规划必须包含1次
+- 每个任务都必须明确指定 tools_needed 字段列明需要调用的工具名
+- 始终检查当前售价是否合理（供应商价+合理利润），如果价格过低必须调价
+- 输出 JSON:
 {
   "tasks": [
     {
       "id": "task_<desc>",
-      "type": "search|calculate|analyze|execute",
-      "description": "具体任务描述",
+      "type": "execute",
+      "description": "具体任务描述（必须包含调用的工具名）",
       "depends_on": [],
       "tools_needed": ["工具名"]
     }
