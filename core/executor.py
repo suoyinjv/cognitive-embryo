@@ -91,6 +91,15 @@ class Executor:
                 "不要返回纯文本分析结果——你必须调用工具。\n"
                 "只读查询（市场状态/日报/竞品）才用 get_ 开头的工具。\n"
             )
+            # 直接调用hermes_search（绕过LLM，DeepSeek调工具有问题）
+            if "hermes_search" in task.description:
+                import re as _r
+                qm = _r.search(r'搜索(.+?)(?:，|。|$|趋势|数据|信息)', task.description)
+                q = qm.group(1).strip() if qm else "市场趋势"
+                t = self.memory.find_tool("hermes_search")
+                if t:
+                    return await self._run_tool(t, "hermes_search", {"query": q}, task)
+
             response = await self._llm.chat.completions.create(
                 model=self._model,
                 messages=[
