@@ -41,11 +41,11 @@ class Executor:
     def _requires_side_effects(task_desc: str) -> bool:
         """检测任务是否需要副作用（非纯文本推理可完成）"""
         side_effect_keywords = [
-            "写文件", "创建", "下载", "执行代码", "算法", "编程", "编码",
-            "生成代码", "定价算法", "动态定价", "调价", "调整价格",
-            "自动计算", "部署", "安装", "修改文件", "生成报告文件",
+            "写文件", "创建", "下载", "执行代码", "编程", "编码",
+            "生成代码", "定价算法",
+            "部署", "安装", "修改文件", "生成报告文件",
             "write file", "create file", "download", "execute code",
-            "algorithm", "generate code", "pricing algorithm",
+            "generate code", "pricing algorithm",
         ]
         desc_lower = task_desc.lower()
         return any(kw in desc_lower for kw in side_effect_keywords)
