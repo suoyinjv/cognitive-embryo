@@ -1,322 +1,397 @@
-"""电商运营模拟器 — 提供真实数据反馈的虚拟市场
+"""电商模拟器 v2 — 多商品 + AI竞品 + 供应链 + 市场周期
 
-API:
-  GET  /supplier-price  → {"price": 当前采购价, "trend": "up/down/stable"}
-  GET  /competitor-price → {"price": 竞品均价, "count": 竞品数}
-  POST /ad-spend         → {"cost": 消耗, "impressions": 曝光, "clicks": 点击, "conversions": 转化}
-  GET  /daily-sales      → {"revenue": 收入, "units_sold": 销量, "avg_price": 均价, "profit": 利润}
-  POST /pricing          → 设置售价
-  GET  /market-status    → 全局市场状态
-  POST /reset            → 重置模拟器
+API端点（兼容v1）:
+  GET  /competitor-price   竞品均价
+  GET  /supplier-price     供应商价格
+  GET  /daily-sales        销售报告
+  POST /pricing            设置售价 (body: {"price": 12.5})
+  POST /ad-spend           投放广告 (body: {"budget": 100})
+  POST /inventory          补货 (body: {"units": 50})
+  POST /tick               推进一天
+  GET  /market-status      市场全局状态
+  POST /reset              重置模拟器
 
-启动:
-  python simulator.py
-  # 默认监听 0.0.0.0:5800
+新增v2端点:
+  GET  /products           商品列表及各自状态
+  POST /product-pricing    设置某商品售价 (body: {"product_id": "a", "price": 15})
+  GET  /competitors        各商品竞品信息
+  GET  /market-forecast    市场需求预测
 """
 
-from __future__ import annotations
-
+import json
+import logging
+import math
 import random
-import time
-from datetime import datetime, timezone
-
+import uuid
+from datetime import datetime
 from flask import Flask, jsonify, request
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("simulator")
 
 app = Flask(__name__)
 
+# ── 商品定义 ──
+PRODUCT_CATEGORIES = {
+    "a": {"name": "电子产品", "base_demand": 1000,  "base_cost": 50,  "volatility": 0.3, "ad_elasticity": 0.5},
+    "b": {"name": "服装配饰", "base_demand": 2000,  "base_cost": 20,  "volatility": 0.4, "ad_elasticity": 0.3},
+    "c": {"name": "食品饮料", "base_demand": 5000,  "base_cost": 8,   "volatility": 0.2, "ad_elasticity": 0.2},
+    "d": {"name": "家用电器", "base_demand": 500,   "base_cost": 200, "volatility": 0.35,"ad_elasticity": 0.4},
+}
+
 # ── 市场状态 ──
+
+class ProductState:
+    __slots__ = ("id", "price", "inventory", "supplier_price", "supplier_trend", "units_sold_today",
+                 "total_units_sold", "total_revenue", "total_cost", "ad_budget", "demand_multiplier")
+    def __init__(self, pid: str, cat: dict):
+        self.id = pid
+        self.price = cat["base_cost"] * 1.8  # 初始售价=成本x1.8
+        self.inventory = 200
+        self.supplier_price = cat["base_cost"]
+        self.supplier_trend = "stable"
+        self.units_sold_today = 0
+        self.total_units_sold = 0
+        self.total_revenue = 0.0
+        self.total_cost = 0.0
+        self.ad_budget = 0.0
+        self.demand_multiplier = 1.0
 
 class Market:
     def __init__(self):
         self.day = 0
-        self.supplier_price = 50.0      # 采购成本
-        self.competitor_avg_price = 99.0
-        self.competitor_count = random.randint(3, 8)
-        self.market_demand = 1000        # 市场总需求
-        self.price_sensitivity = 2.0     # 价格弹性
-
-        # 我的状态
-        self.my_price = 89.0
-        self.my_inventory = 200
-        self.ad_budget = 0
-        self.total_revenue = 0.0
-        self.total_cost = 0.0
-        self.units_sold_today = 0
-        self.total_units_sold = 0
-
-        # 趋势
-        self.supplier_trend = "stable"
-        self.competitor_trend = "stable"
-        self.demand_trend = "stable"
-
-        # 事件日志
+        self.products: dict[str, ProductState] = {}
+        for pid, cat in PRODUCT_CATEGORIES.items():
+            self.products[pid] = ProductState(pid, cat)
+        self.competitors: dict[str, list[dict]] = {}  # pid -> [{name, price}]
+        self.market_cycle = 0  # 0-99, 影响需求
         self.events: list[str] = []
+        self.event_log: list[str] = []
+        self.ai_competitors_count = 5
+        self._init_competitors()
 
-    def _log(self, msg: str) -> None:
-        self.events.append(f"[Day {self.day}] {msg}")
-        if len(self.events) > 50:
-            self.events.pop(0)
+    def _init_competitors(self):
+        for pid, ps in self.products.items():
+            cat = PRODUCT_CATEGORIES[pid]
+            base = cat["base_cost"]
+            comps = []
+            for i in range(self.ai_competitors_count):
+                comps.append({
+                    "name": f"竞品{chr(65+i)}",
+                    "price": round(base * random.uniform(1.3, 2.5), 2),
+                })
+            self.competitors[pid] = comps
 
-    def tick(self) -> None:
-        """模拟一天过去，市场波动"""
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.event_log.append(f"[Day{self.day} {ts}] {msg}")
+
+    def _calc_demand(self, pid: str, ps: ProductState) -> int:
+        """计算某商品当天的需求"""
+        cat = PRODUCT_CATEGORIES[pid]
+        base = cat["base_demand"]
+        # 市场周期：正弦波 ±30%
+        cycle = 1.0 + 0.3 * math.sin(self.market_cycle * math.pi / 25)
+        # 竞争对手压力：竞品价格越低，需求越低
+        avg_comp = sum(c["price"] for c in self.competitors[pid]) / len(self.competitors[pid])
+        price_ratio = ps.price / avg_comp if avg_comp > 0 else 1.0
+        # 价格弹性：价格高于竞品均价10%，需求下降20%
+        price_factor = 1.0 - 2.0 * max(0, price_ratio - 1.0)
+        # 广告影响
+        ad_factor = 1.0 + cat["ad_elasticity"] * math.log1p(ps.ad_budget) / 10 if ps.ad_budget > 0 else 1.0
+        # 需求乘数
+        demand = int(base * cycle * price_factor * ad_factor * ps.demand_multiplier)
+        return max(1, demand)
+
+    def tick_ai_competitors(self):
+        """AI竞品调整价格 — 模拟真实市场反应"""
+        for pid, ps in self.products.items():
+            comps = self.competitors[pid]
+            cat = PRODUCT_CATEGORIES[pid]
+            for c in comps:
+                # 竞品有概率根据我的价格调整
+                if random.random() < 0.3:
+                    # 如果我的价格低于竞品平均，竞品降价竞争
+                    avg_comp = sum(x["price"] for x in comps) / len(comps)
+                    if ps.price < avg_comp * 0.9:
+                        c["price"] = round(c["price"] * random.uniform(0.92, 0.98), 2)
+                    elif ps.price > avg_comp * 1.2:
+                        c["price"] = round(c["price"] * random.uniform(1.02, 1.08), 2)
+                    else:
+                        # 随机波动
+                        c["price"] = round(c["price"] * random.uniform(0.95, 1.05), 2)
+                    # 保证不低于成本
+                    c["price"] = max(cat["base_cost"] * 1.1, c["price"])
+
+    def tick_suppliers(self):
+        """供应商价格波动"""
+        for pid, ps in self.products.items():
+            change = random.uniform(-0.08, 0.08)
+            ps.supplier_price = round(ps.supplier_price * (1 + change), 2)
+            cat = PRODUCT_CATEGORIES[pid]
+            ps.supplier_price = max(cat["base_cost"] * 0.7, min(cat["base_cost"] * 3.0, ps.supplier_price))
+            if change > 0.05:
+                ps.supplier_trend = "up"
+            elif change < -0.05:
+                ps.supplier_trend = "down"
+            else:
+                ps.supplier_trend = "stable"
+
+    def tick_sales(self):
+        """结算当日销售"""
+        for pid, ps in self.products.items():
+            demand = self._calc_demand(pid, ps)
+            sold = min(demand, ps.inventory)
+            ps.units_sold_today = sold
+            ps.total_units_sold += sold
+            revenue = sold * ps.price
+            cost = sold * ps.supplier_price + ps.ad_budget
+            ps.total_revenue += revenue
+            ps.total_cost += cost
+            ps.inventory -= sold
+            ps.ad_budget = 0  # 广告每日重置
+
+    def trigger_random_event(self):
+        """触发随机混沌事件"""
+        if random.random() > 0.25:  # 25%概率触发
+            return
+        event_type = random.choice(["price_war", "supply_shock", "ad_crash", "demand_surge", "new_competitor", "quality_scandal"])
+        pid = random.choice(list(self.products.keys()))
+        ps = self.products[pid]
+        cat = PRODUCT_CATEGORIES[pid]
+        
+        if event_type == "price_war":
+            # 竞品集体降价20%
+            for c in self.competitors[pid]:
+                c["price"] = round(c["price"] * 0.8, 2)
+            self._log(f"⚠️ 价格战! {cat['name']}竞品集体降价20%")
+            
+        elif event_type == "supply_shock":
+            # 供应商价格暴涨50%
+            ps.supplier_price = round(ps.supplier_price * 1.5, 2)
+            ps.supplier_trend = "up"
+            self._log(f"⚠️ 供应冲击! {cat['name']}原材料成本暴涨50%")
+            
+        elif event_type == "ad_crash":
+            # 广告渠道故障
+            ps.ad_budget = 0
+            self._log(f"⚠️ 广告崩溃! {cat['name']}广告渠道故障")
+            
+        elif event_type == "demand_surge":
+            # 需求暴增
+            ps.demand_multiplier = 2.0
+            self._log(f"⚠️ 需求暴增! {cat['name']}市场需求翻倍")
+            
+        elif event_type == "new_competitor":
+            # 新竞品入场
+            self.competitors[pid].append({
+                "name": f"新竞品{chr(70+len(self.competitors[pid]))}",
+                "price": round(cat["base_cost"] * random.uniform(1.2, 1.8), 2),
+            })
+            self._log(f"⚠️ 新对手入场! {cat['name']}出现新竞品")
+            
+        elif event_type == "quality_scandal":
+            # 质量丑闻，需求暴跌
+            ps.demand_multiplier = 0.3
+            self._log(f"⚠️ 质量丑闻! {cat['name']}需求暴跌70%")
+
+    def advance_day(self):
+        """推进一天"""
+        self.tick_sales()
+        self.tick_ai_competitors()
+        self.tick_suppliers()
+        self.trigger_random_event()
         self.day += 1
-
-        # ── 随机混乱事件 (35%概率) ──
-        chaos_event = ""
-        if random.random() < 0.35:
-            chaos_events = [
-                "supplier_shortage",      # 供应商短缺 → 采购价飙3倍
-                "price_war",              # 竞品价格战 → 竞品价暴跌50%
-                "ad_channel_down",        # 广告渠道崩溃 → 广告无效
-                "inventory_rot",          # 库存腐烂 → 库存莫名减少
-                "demand_crash",           # 需求骤降 → 市场需求跌60%
-                "tax_inspection",         # 税务检查 → 追加成本
-            ]
-            chaos_type = random.choice(chaos_events)
-            chaos_event = f"⚡ 混沌事件: "
-
-            if chaos_type == "supplier_shortage":
-                self.supplier_price = round(self.supplier_price * random.uniform(2.0, 3.5), 2)
-                self.supplier_trend = "crisis"
-                chaos_event += f"供应商短缺! 采购价飙至${self.supplier_price}"
-            elif chaos_type == "price_war":
-                self.competitor_avg_price = round(self.competitor_avg_price * random.uniform(0.4, 0.6), 2)
-                self.competitor_count = min(12, self.competitor_count + random.randint(1, 3))
-                chaos_event += f"竞品发动价格战! 均价暴跌至${self.competitor_avg_price}"
-            elif chaos_type == "ad_channel_down":
-                self._ad_blocked_days = 3
-                chaos_event += "广告渠道故障! 3天内广告投放无效"
-            elif chaos_type == "inventory_rot":
-                lost = int(self.my_inventory * random.uniform(0.1, 0.3))
-                self.my_inventory = max(0, self.my_inventory - lost)
-                chaos_event += f"库存腐烂! {lost}件报废"
-            elif chaos_type == "demand_crash":
-                self.market_demand = int(self.market_demand * 0.4)
-                chaos_event += f"市场需求骤降60%"
-            elif chaos_type == "tax_inspection":
-                tax = random.uniform(500, 2000)
-                self.total_cost += tax
-                chaos_event += f"税务检查! 追加罚款${tax:.0f}"
-
-            self._log(chaos_event)
-
-        # ── 检验广告阻塞 ──
-        if hasattr(self, '_ad_blocked_days') and self._ad_blocked_days > 0:
-            self._ad_blocked_days -= 1
-
-        # 供应商价格波动 ±15%
-        delta = random.uniform(-0.15, 0.15)
-        self.supplier_price = round(self.supplier_price * (1 + delta), 2)
-        self.supplier_price = max(20, min(120, self.supplier_price))
-
-        if delta > 0.05:
-            self.supplier_trend = "up"
-        elif delta < -0.05:
-            self.supplier_trend = "down"
-        else:
-            self.supplier_trend = "stable"
-
-        # 竞品价格波动
-        delta = random.uniform(-0.10, 0.10)
-        self.competitor_avg_price = round(self.competitor_avg_price * (1 + delta), 2)
-        self.competitor_avg_price = max(30, min(200, self.competitor_avg_price))
-
-        if random.random() < 0.2:
-            self.competitor_count += random.choice([-1, 0, 1])
-            self.competitor_count = max(1, self.competitor_count)
-
-        # 市场需求波动
-        delta = random.uniform(-0.20, 0.20)
-        self.market_demand = int(self.market_demand * (1 + delta))
-        self.market_demand = max(200, min(3000, self.market_demand))
-
-        # 我的销量: 价格比竞品低 → 占有率上升
-        price_ratio = self.competitor_avg_price / max(self.my_price, 1)
-        base_share = 1.0 / (self.competitor_count + 1)
-        my_share = base_share * (price_ratio ** self.price_sensitivity)
-
-        # 广告加成
-        ad_boost = min(0.3, self.ad_budget / 1000.0)
-        my_share += ad_boost
-
-        # 计算销量
-        self.units_sold_today = int(self.market_demand * my_share)
-        self.units_sold_today = min(self.units_sold_today, self.my_inventory)
-
-        # 财务
-        revenue = self.units_sold_today * self.my_price
-        cost = self.units_sold_today * self.supplier_price + self.ad_budget
-        profit = revenue - cost
-
-        self.total_revenue += revenue
-        self.total_cost += cost
-        self.total_units_sold += self.units_sold_today
-        self.my_inventory -= self.units_sold_today
-
-        self._log(
-            f"卖出{self.units_sold_today}件, "
-            f"收入${revenue:.0f}, 成本${cost:.0f}, "
-            f"利润${profit:.0f}, 库存{self.my_inventory}"
-        )
-
-        # 随机事件
-        if random.random() < 0.1:
-            events = [
-                "供应商原料短缺，下周价格可能上涨",
-                "新竞争对手进入市场",
-                "社交媒体上你的产品获得好评，需求上升20%",
-                "竞争对手发起价格战，降价15%",
-                "季节性需求高峰到来",
-            ]
-            event = random.choice(events)
-            self._log(f"⚡ 市场事件: {event}")
-            if "好评" in event:
-                self.market_demand = int(self.market_demand * 1.2)
-            if "价格战" in event:
-                self.competitor_avg_price *= 0.85
-
-        # 重置每日预算
-        self.ad_budget = 0
+        self.market_cycle = (self.market_cycle + 1) % 100
+        # 重置需求乘数（逐步恢复）
+        for ps in self.products.values():
+            if ps.demand_multiplier < 1.0:
+                ps.demand_multiplier = min(1.0, ps.demand_multiplier + 0.1)
+            elif ps.demand_multiplier > 1.0:
+                ps.demand_multiplier = max(1.0, ps.demand_multiplier - 0.1)
+        # 每隔几天清一下日志
+        if self.day % 10 == 0:
+            self.event_log = self.event_log[-50:]
+        self._log(f"→ 第{self.day}天开始")
 
 
+# ── 全局市场实例 ──
 market = Market()
 
 
-# ── API ──
-
-@app.route("/supplier-price")
-def supplier_price():
-    return jsonify({
-        "price": market.supplier_price,
-        "trend": market.supplier_trend,
-        "day": market.day,
-    })
-
+# ══════════════════════════════════════════
+# v1 兼容端点（单商品 = 商品"a"）
+# ══════════════════════════════════════════
 
 @app.route("/competitor-price")
 def competitor_price():
-    return jsonify({
-        "price": market.competitor_avg_price,
-        "count": market.competitor_count,
-        "trend": market.competitor_trend,
-    })
+    ps = market.products["a"]
+    comps = market.competitors["a"]
+    avg = round(sum(c["price"] for c in comps) / len(comps), 2) if comps else 0
+    return jsonify({"avg_price": avg, "count": len(comps), "prices": [c["price"] for c in comps[:3]]})
 
-
-@app.route("/ad-spend", methods=["POST"])
-def ad_spend():
-    # 广告渠道故障检测
-    if hasattr(market, '_ad_blocked_days') and market._ad_blocked_days > 0:
-        return jsonify({
-            "error": "channel_down",
-            "message": f"广告渠道故障中，预计{market._ad_blocked_days}天后恢复",
-            "cost": 0,
-            "impressions": 0,
-            "clicks": 0,
-            "conversions": 0,
-        }), 503
-
-    data = request.get_json() or {}
-    budget = float(data.get("budget", 0))
-    market.ad_budget = budget
-
-    cpm = random.uniform(5, 15)  # 千次曝光成本
-    impressions = int(budget / cpm * 1000) if budget > 0 else 0
-    ctr = random.uniform(0.01, 0.05)
-    clicks = int(impressions * ctr)
-    conversion_rate = random.uniform(0.02, 0.08)
-    conversions = int(clicks * conversion_rate)
-
-    return jsonify({
-        "cost": budget,
-        "impressions": impressions,
-        "clicks": clicks,
-        "conversions": conversions,
-        "cpm": round(cpm, 2),
-        "ctr": f"{ctr:.1%}",
-    })
-
+@app.route("/supplier-price")
+def supplier_price():
+    ps = market.products["a"]
+    return jsonify({"price": ps.supplier_price, "trend": ps.supplier_trend})
 
 @app.route("/daily-sales")
 def daily_sales():
-    profit = market.total_revenue - market.total_cost
+    total_revenue = sum(p.total_revenue for p in market.products.values())
+    total_cost = sum(p.total_cost for p in market.products.values())
+    total_units = sum(p.total_units_sold for p in market.products.values())
     return jsonify({
-        "day": market.day,
-        "revenue": round(market.total_revenue, 2),
-        "cost": round(market.total_cost, 2),
-        "profit": round(profit, 2),
-        "units_sold_today": market.units_sold_today,
-        "total_units_sold": market.total_units_sold,
-        "avg_price": market.my_price,
-        "inventory": market.my_inventory,
+        "revenue": round(total_revenue, 2),
+        "cost": round(total_cost, 2),
+        "profit": round(total_revenue - total_cost, 2),
+        "units_sold": total_units,
     })
-
 
 @app.route("/pricing", methods=["POST"])
 def set_pricing():
     data = request.get_json() or {}
-    new_price = float(data.get("price", market.my_price))
-    market.my_price = round(new_price, 2)
-    market._log(f"调整售价为 ${market.my_price}")
-    return jsonify({"price": market.my_price, "status": "ok"})
+    new_price = float(data.get("price", market.products["a"].price))
+    market.products["a"].price = round(new_price, 2)
+    market._log(f"商品A: 售价调整为 ${market.products['a'].price}")
+    return jsonify({"product": "a", "price": market.products["a"].price, "status": "ok"})
 
+@app.route("/ad-spend", methods=["POST"])
+def ad_spend():
+    data = request.get_json() or {}
+    budget = float(data.get("budget", 0))
+    # 分摊到所有商品
+    for pid, ps in market.products.items():
+        ps.ad_budget += budget / len(market.products)
+    market._log(f"广告: 投放 ${budget}")
+    # 模拟广告效果
+    reach = int(budget * random.uniform(50, 200))
+    clicks = int(reach * random.uniform(0.01, 0.05))
+    return jsonify({"budget": budget, "reach": reach, "clicks": clicks, "status": "ok"})
 
 @app.route("/inventory", methods=["POST"])
 def restock():
     data = request.get_json() or {}
     units = int(data.get("units", 100))
-    cost = units * market.supplier_price
-    market.my_inventory += units
-    market.total_cost += cost
-    market._log(f"采购{units}件, 成本${cost:.0f}")
-    return jsonify({
-        "units_added": units,
-        "cost": round(cost, 2),
-        "inventory": market.my_inventory,
-    })
-
-
-@app.route("/market-status")
-def market_status():
-    profit = market.total_revenue - market.total_cost
-    return jsonify({
-        "day": market.day,
-        "supplier_price": market.supplier_price,
-        "supplier_trend": market.supplier_trend,
-        "competitor_price": market.competitor_avg_price,
-        "competitor_count": market.competitor_count,
-        "market_demand": market.market_demand,
-        "my_price": market.my_price,
-        "my_inventory": market.my_inventory,
-        "ad_budget": market.ad_budget,
-        "total_revenue": round(market.total_revenue, 2),
-        "total_cost": round(market.total_cost, 2),
-        "total_profit": round(profit, 2),
-        "units_sold_today": market.units_sold_today,
-        "total_units_sold": market.total_units_sold,
-    })
-
+    pid = data.get("product_id", "a")
+    ps = market.products.get(pid, market.products["a"])
+    cost = units * ps.supplier_price
+    ps.inventory += units
+    ps.total_cost += cost
+    market._log(f"商品{pid}: 采购{units}件, 成本${cost:.0f}")
+    return jsonify({"product": pid, "units_added": units, "cost": round(cost, 2), "inventory": ps.inventory})
 
 @app.route("/tick", methods=["POST"])
 def advance_day():
-    """推进一天"""
-    market.tick()
-    return jsonify({"day": market.day, "status": "ok", "events": market.events[-3:]})
+    market.advance_day()
+    return jsonify({"day": market.day, "status": "ok"})
+
+@app.route("/market-status")
+def market_status():
+    profit = sum(p.total_revenue - p.total_cost for p in market.products.values())
+    ps = market.products["a"]
+    comps = market.competitors["a"]
+    return jsonify({
+        "day": market.day,
+        "products": len(market.products),
+        "supplier_price": ps.supplier_price,
+        "supplier_trend": ps.supplier_trend,
+        "competitor_price": round(sum(c["price"] for c in comps) / len(comps), 2) if comps else 0,
+        "competitor_count": len(comps),
+        "my_price": ps.price,
+        "my_inventory": ps.inventory,
+        "ad_budget": ps.ad_budget,
+        "total_revenue": round(profit.comp, 2) if hasattr(profit, 'comp') else round(sum(p.total_revenue for p in market.products.values()), 2),
+        "total_cost": round(sum(p.total_cost for p in market.products.values()), 2),
+        "total_profit": round(profit, 2),
+        "units_sold_today": ps.units_sold_today,
+        "total_units_sold": ps.total_units_sold,
+    })
 
 
-@app.route("/events")
-def get_events():
-    return jsonify({"events": market.events[-20:]})
+# ══════════════════════════════════════════
+# v2 新增端点
+# ══════════════════════════════════════════
 
+@app.route("/products")
+def products():
+    """获取所有商品状态"""
+    result = {}
+    for pid, ps in market.products.items():
+        cat = PRODUCT_CATEGORIES[pid]
+        result[pid] = {
+            "name": cat["name"],
+            "price": ps.price,
+            "inventory": ps.inventory,
+            "supplier_price": ps.supplier_price,
+            "units_sold_today": ps.units_sold_today,
+            "total_units_sold": ps.total_units_sold,
+            "profit": round(ps.total_revenue - ps.total_cost, 2),
+        }
+    return jsonify(result)
+
+@app.route("/product-pricing", methods=["POST"])
+def product_pricing():
+    """设置某商品售价"""
+    data = request.get_json() or {}
+    pid = data.get("product_id", "a")
+    price = float(data.get("price", 0))
+    if pid not in market.products:
+        return jsonify({"error": f"unknown product: {pid}"}), 400
+    market.products[pid].price = round(price, 2)
+    market._log(f"商品{pid}: 售价调整为 ${price}")
+    return jsonify({"product": pid, "price": market.products[pid].price, "status": "ok"})
+
+@app.route("/competitors")
+def competitors():
+    """各商品竞品信息"""
+    result = {}
+    for pid, comps in market.competitors.items():
+        cat = PRODUCT_CATEGORIES[pid]
+        result[pid] = {
+            "category": cat["name"],
+            "count": len(comps),
+            "avg_price": round(sum(c["price"] for c in comps) / len(comps), 2),
+            "competitors": comps[:5],
+        }
+    return jsonify(result)
+
+@app.route("/market-forecast")
+def market_forecast():
+    """未来几天需求预测"""
+    forecasts = {}
+    for pid in market.products:
+        cat = PRODUCT_CATEGORIES[pid]
+        base = cat["base_demand"]
+        next_3 = []
+        for i in range(1, 4):
+            cycle = 1.0 + 0.3 * math.sin((market.market_cycle + i) * math.pi / 25)
+            next_3.append(int(base * cycle))
+        forecasts[pid] = {"name": cat["name"], "next_3_days": next_3}
+    return jsonify(forecasts)
+
+@app.route("/event-log")
+def event_log():
+    """最近事件日志"""
+    return jsonify(market.event_log[-30:])
 
 @app.route("/reset", methods=["POST"])
 def reset():
     global market
     market = Market()
-    return jsonify({"status": "reset", "day": 0})
+    logger.info("模拟器已重置")
+    return jsonify({"status": "ok", "day": 0})
 
 
 if __name__ == "__main__":
-    print("🏪 电商模拟器启动: http://0.0.0.0:5800")
-    print("   API: /market-status /daily-sales /supplier-price /competitor-price")
-    print("   Action: /pricing /inventory /ad-spend /tick /reset")
+    logger.info("=" * 50)
+    logger.info("电商模拟器 v2 启动")
+    logger.info(f"商品种类: {len(PRODUCT_CATEGORIES)}")
+    logger.info(f"竞品数量: 每个商品 {market.ai_competitors_count} 个AI竞品")
+    logger.info("=" * 50)
+    logger.info(f"  v1端点: competitor-price, supplier-price, daily-sales,")
+    logger.info(f"          pricing, ad-spend, inventory, tick, market-status")
+    logger.info(f"  v2端点: products, product-pricing, competitors,")
+    logger.info(f"          market-forecast, event-log")
+    logger.info(f"  混沌事件: 价格战,供应冲击,广告崩溃,需求暴增,新对手,质量丑闻")
+    logger.info("=" * 50)
     app.run(host="0.0.0.0", port=5800, debug=False)

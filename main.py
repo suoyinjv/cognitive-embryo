@@ -242,12 +242,12 @@ def run_ad_campaign(budget: float):
 
         ("restock_inventory", "采购补货",
 '''import urllib.request, json
-def restock_inventory(units: int):
+def restock_inventory(units: int, product_id: str = "a"):
     data = json.dumps({"units": units}).encode()
     req = urllib.request.Request("http://127.0.0.1:5800/inventory", data=data, headers={"Content-Type":"application/json"}, method="POST")
     with urllib.request.urlopen(req) as r:
         return json.dumps(json.loads(r.read()), ensure_ascii=False)''',
-         {"name": "restock_inventory", "description": "采购补货，增加库存",
+         {"name": "restock_inventory", "description": "采购补货（指定product_id可对不同商品补货，默认a）",
           "parameters": {"type": "object", "properties": {"units": {"type": "integer", "description": "采购数量"}}, "required": ["units"]}}),
 
         ("advance_day", "推进到下一天（触发市场波动和销售结算）",
