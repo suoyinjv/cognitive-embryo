@@ -241,9 +241,14 @@ class MetaCognitionController:
 
         if root_cause == FailureRootCause.TOOL_INADEQUATE:
             if retry_count >= config.max_retries_per_task:
-                # 触发工具创造 - 从错误提取缺失工具名
+                # 防重: 缺失工具已存在 → 不创建，而是重规划
                 missing_match = re.search(r'工具未找到:\s*(\S+)', error)
                 missing_tool = missing_match.group(1) if missing_match else None
+                if missing_tool and self.memory.find_tool(missing_tool):
+                    return FailureDecision(
+                        action="replan",
+                        reason=f"工具{missing_tool}已存在但没被正确调用，重规划",
+                    )
                 tool_spec = await self._generate_tool_spec(task, error, missing_tool)
                 return FailureDecision(
                     action="create_tool",

@@ -232,6 +232,13 @@ class EvolutionMemory:
     def list_active_tools(self) -> list[CreatedTool]:
         return list(self.tools.values())
 
+    def find_tool(self, name: str) -> Optional[CreatedTool]:
+        """按名称查找工具"""
+        for t in self.tools.values():
+            if t.name == name or t.schema.get("name") == name:
+                return t
+        return None
+
     def get_tool_schemas(self) -> list[dict]:
         return [
             {"type": "function", "function": t.schema}
