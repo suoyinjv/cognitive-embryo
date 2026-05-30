@@ -46,6 +46,7 @@ class Executor:
             "部署", "安装", "修改文件", "生成报告文件",
             "write file", "create file", "download", "execute code",
             "generate code", "pricing algorithm",
+            "搜索", "查询网络", "hermes_search", "hermes_terminal",
         ]
         desc_lower = task_desc.lower()
         return any(kw in desc_lower for kw in side_effect_keywords)
@@ -125,6 +126,18 @@ class Executor:
                     success=False,
                     error=f"LLM返回结果为空或过短，可能不具备该能力。输出: {content[:100]}",
                     tool_called="llm_empty",
+                )
+
+            # 任务描述明确提到某个工具名，但LLM没调 → 幻觉
+            import re as _re
+            mentioned_tools = _re.findall(r'\b(hermes_search|hermes_terminal|adjust_price|get_competitor_price|get_supplier_price|restock_inventory|run_ad_campaign|advance_day|get_daily_report|get_products_list|product_pricing|get_competitors_info|calculate)\b', task.description)
+            if mentioned_tools and not tool_calls:
+                tool_names = set(mentioned_tools)
+                return ExecutionResult(
+                    success=False,
+                    error=f"任务明确要求调用工具 {tool_names}，但LLM未调用任何工具(纯文本回复)。幻觉输出: {content[:200]}",
+                    trace="tool_calls为空但任务指定了工具名",
+                    tool_called="llm_hallucination",
                 )
 
             # 执行工具调用
